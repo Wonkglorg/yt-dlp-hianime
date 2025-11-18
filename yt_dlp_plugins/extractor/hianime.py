@@ -138,6 +138,7 @@ class HiAnimeIE(InfoExtractor):
 
     def _extract_episode(self, slug, playlist_id, episode_id):
         anime_title = self._get_anime_title(slug, playlist_id)
+        args = self._get_selected_language()
 
         if episode_id not in self.episode_list:
             self._extract_playlist(slug, playlist_id)
@@ -152,67 +153,105 @@ class HiAnimeIE(InfoExtractor):
 
         formats = []
         subtitles = {}
-
-        for server_type in ['sub', 'dub', 'raw']:
-            # 1. Initial element fetching
-            server_items_from_func = self._get_elements_by_tag_and_attrib(
-                servers_data['html'], tag='div', attribute='data-type', value=server_type, escape_value=False
+        for server_type in [args]:
+            # Get all server items for this type
+            server_items = self._get_elements_by_tag_and_attrib(
+                servers_data['html'], tag='div', attribute='data-type',
+                value=server_type, escape_value=False
             )
-            
-            # 2. Stricter filtering
-            server_items_filtered = [s for s in server_items_from_func if f'data-type="{server_type}"' in s.group(0)]
-            
-            # 3. Extracting the server ID
-            target_link_text = "HD-1"
-            server_id = next(
-                (
-                    # This part extracts the data-id if all conditions are met
-                    re.search(r'data-id="([^"]+)"', s.group(0)).group(1)
-                    
-                    # Iterate through the server items already filtered by server_type
-                    for s in server_items_filtered 
-                    
-                    # Add a condition to check for the specific link text
-                    # This regex looks for "> HD-1 </a>", allowing for optional whitespace
-                    if re.search(rf'>\s*{re.escape(target_link_text)}\s*</a>', s.group(0))
-                    # And ensure the data-id attribute exists (good practice before .group(1))
-                    and re.search(r'data-id="([^"]+)"', s.group(0))
-                ),
-                None  # Default value if no such item is found
-            )
-            if not server_id:
-                continue
 
-            sources_url = f'{self.base_url}/ajax/v2/episode/sources?id={server_id}'
-            sources_data = self._download_json(sources_url, episode_id, note=f'Getting {server_type.upper()} Episode Information')
-            embed_url = sources_data.get('link')
-            if not embed_url:
-                continue
+            server_items_filtered = [
+                s for s in server_items
+                if f'data-type="{server_type}"' in s.group(0)
+            ]
 
-            scraper=Megacloud(embed_url)
-            data=scraper.extract()
-            
-            for source in data.get('sources', []):
-                file_url = source.get('file')
-                if not (file_url and file_url.endswith('.m3u8')):
+            server_id = None
+            working_formats = None
+            working_subtitles_data = None
+
+            # Try HD-1, HD-2, HD-3
+            for n in range(1, 4):
+                target_label = f"HD-{n}"
+
+                candidate_id = None
+                for s in server_items_filtered:
+                    block = s.group(0)
+                    if (re.search(rf'>\s*{re.escape(target_label)}\s*</a>', block)
+                            and (m := re.search(r'data-id="([^"]+)"', block))):
+                        candidate_id = m.group(1)
+                        break
+
+                if not candidate_id:
+                    continue  # HD-n not present
+
+                try:
+                    sources_url = f'{self.base_url}/ajax/v2/episode/sources?id={candidate_id}'
+                    src_json = self._download_json(
+                        sources_url, episode_id,
+                        note=f'Trying {server_type.upper()} {target_label}'
+                    )
+
+                    embed_url = src_json.get('link')
+                    if not embed_url:
+                        continue
+
+                    scraper = Megacloud(embed_url)
+                    data = scraper.extract()
+
+                    # Collect m3u8
+                    m3u8_list = [
+                        s.get("file") for s in (data.get("sources", []) + data.get("sourcesBackup", []))
+                        if s.get("file", "").endswith(".m3u8")
+                    ]
+
+                    if not m3u8_list:
+                        continue
+
+                    # Try each m3u8 if any invalid parts exist
+                    hd_formats = None
+                    for m3u8_url in m3u8_list:
+                        try:
+                            extracted = self._extract_custom_m3u8_formats(
+                                m3u8_url,
+                                episode_id,
+                                headers={"Referer": "https://megacloud.blog/"},
+                                server_type=server_type
+                            )
+                            if extracted:
+                                hd_formats = extracted
+                                break
+                        except Exception:
+                            continue
+
+                    if not hd_formats:
+                        continue
+
+                    server_id = candidate_id
+                    working_formats = hd_formats
+                    working_subtitles_data = data
+                    break
+
+                except Exception:
                     continue
 
-                extracted_formats = self._extract_custom_m3u8_formats(
-                    file_url,
-                    episode_id,
-                    headers={"Referer": "https://megacloud.blog/"},
-                    server_type=server_type
+            if not server_id or not working_formats:
+                raise ExtractorError(
+                    f"[HiAnime] No {server_type.upper()} servers could be reached for episode {episode_id}",
+                    expected=True
                 )
-                formats.extend(extracted_formats)
 
-            for track in data.get('tracks', []):
-                if track.get('kind') != 'captions':
+            formats.extend(working_formats)
+
+            data = working_subtitles_data
+            # Extract subtitles
+            for track in data.get("tracks", []):
+                if track.get("kind") != "captions":
                     continue
 
-                file_url = track.get('file')
-                label = track.get('label')
+                label = track.get("label") or ""
+                file_url = track.get("file")
 
-                if label == 'English':
+                if label == "English":
                     label += f' {server_type.capitalize()}bed'
 
                 lang_code = self.language_codes.get(label, label)
@@ -247,6 +286,17 @@ class HiAnimeIE(InfoExtractor):
             f['language'] = self.language[server_type]
             f['http_headers'] = headers
         return formats
+
+    # gets custom yt-dlp language parameter
+    def _get_selected_language(self):
+        args = self._configuration_arg('language')
+
+        if args:
+            choice = args[-1].lower()
+            if choice in ('sub', 'dub', 'raw'):
+                return choice
+
+        return 'sub'
 
     def _get_anime_title(self, slug, playlist_id):
         if self.anime_title:
